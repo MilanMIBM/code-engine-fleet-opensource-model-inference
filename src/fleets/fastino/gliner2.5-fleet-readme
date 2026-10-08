@@ -1,0 +1,136 @@
+# GLiNER2.5-Decide on a Code Engine GPU fleet (OpenAI-compatible)
+
+Serves `fastino/GLiNER2.5-Decide` behind OpenAI-style routes on a single long-running
+Code Engine fleet task with a GPU. Clients find the server by fleet ID through the
+Code Engine API (IAM-authenticated) and call it with the OpenAI SDK.
+
+```
+gliner-fleet/
+├── .env.example          all settings (copy to .env)
+├── server/               image source: built by Code Engine
+│   ├── server.py         FastAPI: /v1/chat/completions, /v1/responses, /v1/models, /health
+│   ├── Dockerfile        torch + gliner2[local], weights baked in
+│   ├── requirements.txt
+│   └── .ceignore / .dockerignore
+├── deploy/
+│   ├── common.sh         loads .env, logs in, selects the project
+│   ├── 01_setup.sh       subnet pool, HMAC secret + task store, registry secret, optional key
+│   ├── 02_build.sh       Code Engine local-source build -> ICR
+│   ├── 03_create_fleet.py  creates the GPU fleet via the Code Engine API
+│   ├── 04_status.sh      fleet / workers (IPs) / tasks
+│   ├── 05_teardown.sh    deletes the fleet
+│   └── requirements.txt
+└── client/
+    ├── fleet_client.py   fleet ID -> OpenAI client (IAM + Code Engine API)
+    ├── example.py        CLI example
+    └── requirements.txt
+```
+
+## 0. Before anything: uncomment the imports
+
+Every Python file ships with its import block commented out. Uncomment them in
+`server/server.py`, `deploy/03_create_fleet.py`, `client/fleet_client.py` and
+`client/example.py`. `02_build.sh` refuses to build while `server.py` still has
+commented imports.
+
+## 1. Prerequisites
+
+- IBM Cloud CLI with the `code-engine` and `vpc-infrastructure` plugins (`01_setup.sh` installs them).
+- A Code Engine project, an IBM Cloud API key with access to it, and an ICR namespace.
+- A VPC subnet in the project's region, and a **security group** that allows inbound
+  TCP `FLEET_PORT` (8000) only from the CIDRs your clients connect from. This is the
+  real access control for the server port.
+- Image pull path for the workers: if the subnet has Container Registry / Object Storage
+  VPE gateways, attach the same security group to those gateways. Otherwise attach a
+  public gateway to the subnet.
+- A COS bucket and a service credential with HMAC enabled (Writer role) for the fleet's
+  task state store.
+- Python 3.10+ locally for `03_create_fleet.py` and the client.
+
+## 2. Configure
+
+```sh
+cp .env.example .env
+# fill in .env
+```
+
+## 3. Deploy
+
+```sh
+bash deploy/01_setup.sh          # prompts once for the HMAC key id / secret
+# put the printed subnet pool ID into SUBNET_POOL_ID in .env
+
+bash deploy/02_build.sh          # takes a while: big base image + model download
+
+pip install -r deploy/requirements.txt
+python deploy/03_create_fleet.py --dry-run   # review the request body
+python deploy/03_create_fleet.py             # writes CE_FLEET_ID into .env
+
+bash deploy/04_status.sh         # wait for a running worker and a running task
+```
+
+The fleet has exactly one task (index `0`): the server. It stays `running` until
+`MAX_EXECUTION_TIME` is reached, the fleet is deleted, or the server exits; on a crash it
+is restarted up to `RETRY_LIMIT` times.
+
+## 4. Call it
+
+From a machine inside the VPC (or connected to it):
+
+```sh
+pip install -r client/requirements.txt
+set -a; source <(sed -e 's/[[:space:]]#.*$//' .env); set +a
+cd client
+python example.py --text "<your text>" --schema '{"<head>": ["<label_a>", "<label_b>"]}'
+python example.py --text-file input.txt --schema schema.json --api responses --include-confidence
+```
+
+In your own code:
+
+```python
+from fleet_client import FleetOpenAI
+
+fleet = FleetOpenAI()
+resp = fleet.call(lambda c: c.chat.completions.create(
+    model="fastino/GLiNER2.5-Decide",
+    messages=[{"role": "user", "content": text}],
+    extra_body={"schema": schema},
+))
+print(resp.choices[0].message.content)
+```
+
+`schema` uses GLiNER2's `classify_text` shape (single-label lists, `multi_label` /
+`cls_threshold`, described labels, `prompt`); an `entities` key goes to
+`extract_entities`. Responses API: pass it as `extra_body={"text": {"format": {"schema": schema}}}`.
+
+## 5. Test locally first (optional)
+
+```sh
+cd server
+pip install -r requirements.txt
+uvicorn server:app --port 8000            # CPU is fine for this model
+# or: docker build -t gliner-openai . && docker run --gpus all -p 8000:8000 gliner-openai
+curl localhost:8000/health
+```
+
+Then use a plain client: `OpenAI(base_url="http://localhost:8000/v1", api_key="unused")`.
+
+## 6. Tear down
+
+```sh
+bash deploy/05_teardown.sh
+```
+
+## Notes and things to verify on first run
+
+- **Auth model:** IAM protects discovery (the workers/tasks API), not the port. Anything
+  that can reach the worker on 8000 can call it, so keep the security group tight. Set
+  `SERVER_API_KEY` (and `FLEET_SERVER_API_KEY` on clients) if you also want a key check.
+- **`MAX_EXECUTION_TIME`:** the API accepts durations like `8760h`; the docs here don't
+  state a maximum for fleets. If the create call rejects it, lower it.
+- **Worker IP changes** when a worker is replaced; the client re-resolves on connection errors.
+- **CLI flags** in `01_setup.sh` / `02_build.sh` follow the Code Engine docs; `ibmcloud ce registry create`,
+  `build create --size/--timeout` and `buildrun submit --wait` are standard CLI options not covered in
+  those docs; check `--help` if one is rejected.
+- The tasks list path (`/fleets/{id}/tasks?status=running`) used by the client is inferred
+  from the API spec's `list_fleet_tasks`; if it fails, the client falls back to any running worker.

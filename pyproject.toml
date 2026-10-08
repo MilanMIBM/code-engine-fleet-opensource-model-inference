@@ -1,0 +1,19 @@
+[project]
+name = "code-engine-fleet-opensource-model-inference"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "gliner2>=2.0.0",
+    "ibm-cloud-sdk-core>=3.28.0",
+    "jinja2>=3.1.6",
+    "marimo[mcp]>=0.25.1",
+    "pydantic-ai>=2.54.0",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+    "ruff>=0.16.10",
+    "transformers>=5.19.0",
+    "uv>=0.12.23",
+    "wigglystuff>=0.5.34",
+]

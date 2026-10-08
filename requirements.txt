@@ -1,0 +1,11 @@
+uv
+ruff
+requests
+marimo[mcp]
+ibm-cloud-sdk-core
+python-dotenv
+transformers
+pydantic-ai
+wigglystuff
+gliner2
+jinja2
